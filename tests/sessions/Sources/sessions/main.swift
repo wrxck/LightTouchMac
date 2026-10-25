@@ -249,12 +249,12 @@ struct HelperBootCheck: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "helper-boot",
         abstract: """
-            The helper alone on an n72 base: input, rotation, parent death, a meddled overlay, power; with angle, a \
-            snapshot refused on the experimental ANGLE renderer.
+            The helper alone on an n72 base: input, rotation, parent death, a meddled overlay, power, steps given \
+            while it runs; with angle, a snapshot refused on the experimental ANGLE renderer.
             """
     )
     @Argument var base: String
-    @Option(help: "The cases, comma-separated (ipod, meddle, power, angle).") var only = "ipod,meddle,power"
+    @Option(help: "The cases, comma-separated (ipod, meddle, power, live, angle).") var only = "ipod,meddle,power,live"
     @OptionGroup var inputs: Inputs
 
     func run() { helperBoot(self) }

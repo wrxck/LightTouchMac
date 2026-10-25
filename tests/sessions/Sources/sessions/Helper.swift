@@ -196,8 +196,9 @@ func helperChecks(_ args: HelperCheck) -> Never {
 /// hard halt. `meddle`: the app's DeviceFileWatch on the overlay sees its NOR unlinked under the
 /// running helper (the app's notice); SIGTERM halts the helper. `power`: the pump at 60 Hz before boot (30 with the host
 /// constrained); shown 60 Hz with an idle-sleep assertion, hidden at most 5 Hz and none, back to 60 Hz within 100 ms,
-/// paused at most 5 Hz and none, resumed 60 Hz, the guest's display asleep at most 5 Hz, woken 60 Hz again. `--only a,b`
-/// picks cases.
+/// paused at most 5 Hz and none, resumed 60 Hz, the guest's display asleep at most 5 Hz, woken 60 Hz again. `live`:
+/// steps written to helper-driver's --steps FIFO while the guest runs drive it, and the FIFO's end ends the run.
+/// `--only a,b` picks cases.
 func helperBoot(_ args: HelperBootCheck) -> Never {
     let base = Base(args.base, args.inputs)
     guard base.board == "n72ap" else { die("helper-boot boots an n72ap base") }
@@ -244,6 +245,53 @@ func helperBoot(_ args: HelperBootCheck) -> Never {
         )
         // The agent through the link is `sessions single`'s (frontmost, launch, file read-back): it needs the USB host
         // and the package offer this bare boot leaves out.
+    }
+    if only.contains("live") {
+        // The device driven while it runs: once it has lit, steps go to helper-driver's --steps FIFO (the slider among
+        // them), and their end, the FIFO closed, ends the run.
+        print("live")
+        let fifo = work.appendingPathComponent("live-steps")
+        unlink(fifo.path)
+        mkfifo(fifo.path, 0o600)
+        let d = HelperDriver(
+            "live",
+            tools: tools,
+            work: work,
+            scenario: preparedScenario(base, tools: tools, work: work, name: "live", steps: ["boot", "lit 0.03 240"]),
+            extra: ["--steps", fifo.path]
+        )
+        // The driver opens the FIFO after the scenario's steps; a writer that opens it before then has no reader.
+        var writer: Int32 = -1
+        if d.driver.waitFor("lit", 400) != nil {
+            let deadline = Date().addingTimeInterval(10)
+            while writer < 0, Date() < deadline {
+                writer = open(fifo.path, O_WRONLY | O_NONBLOCK)
+                if writer < 0 { usleep(100_000) }
+            }
+        }
+        r.check(writer >= 0, "live: lit, and the driver reads its --steps FIFO")
+        if writer >= 0 {
+            _ = fcntl(writer, F_SETFL, 0)
+            let steps = ["dump lock", "status", unlockSlide, "wait 4", "dump home", "quit", "expectExit 60"]
+            let handle = FileHandle(fileDescriptor: writer, closeOnDealloc: true)
+            handle.write(Data(steps.map { $0 + "\n" }.joined().utf8))
+            try? handle.close()
+        }
+        let finished = d.finish(120) == 0
+        unlink(fifo.path)
+        let e = d.events
+        var dumps: [String: Event] = [:]
+        for x in e.find("dump") { dumps[x.string("name") ?? ""] = x }
+        let lock = dumps["lock"]?.double("brightness") ?? 0
+        let home = dumps["home"]?.double("brightness") ?? 0
+        r.check(
+            dumps["lock"]?.bool("ok") == true && dumps["home"]?.bool("ok") == true && home > 2 * lock
+                && e.any("status"),
+            "live: the FIFO's steps ran in order: lock dump, status, the slider, Home dump (brightness "
+                + "\(format(lock, 2)) then \(format(home, 2)))"
+        )
+        r.check(finished && e.any("done"), "live: the FIFO's end ends the run (QEMU quit, driver exit 0)")
+        if !finished { print(d.tail) }
     }
     if only.contains("angle") {
         // Settings ▸ General's experimental ANGLE renderer keeps no snapshot: a save with the compositor's GL live is

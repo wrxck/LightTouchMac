@@ -13,6 +13,7 @@ import SessionKit
 //
 //   helper-driver --helper PATH --scenario scenario.json --dump DIR [--log native.log] [--requirement R]
 //                 [--lease PATH] [--expect-failure TEXT]   (exit 0 if the start fails with TEXT)
+//                 [--steps FIFO|-]   (more steps after the scenario's, one a line as they arrive, until its end)
 //
 // scenario: {"dylib": "...", "board": "k48ap", "boot": BootConfig, "steps": ["boot", "lit 0.2 300", ...]}; or, for a
 // FirmwareKit base booted as the app boots it (PreparedDeviceBoot with the hello's machine facts), "prepared":
@@ -32,6 +33,8 @@ struct Options: ParsableArguments {
     @Option(help: "The device's lease.") var lease: String?
     @Option(help: "The start must fail with this text.") var expectFailure: String?
     @Flag(help: "The start must be rejected (an impostor).") var expectReject = false
+    @Option(help: "More steps after the scenario's, one a line as they arrive, until its end: a FIFO, or - (stdin).")
+    var steps: String?
 }
 TextReader.serveChild()  // a screen read's child process (TextReader): reads, prints and exits
 let opts = Options.parseOrExit()
@@ -296,8 +299,26 @@ func blocking<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) -> 
     sync { done in Task { done(await Result { try await body() }) } }
 }
 
+/// The scenario's steps, then each line --steps brings as it arrives (blank ones skipped), until its end: a device
+/// driven while it runs. A FIFO opens once the scenario's steps are done, so its writer can wait for their events.
+func allSteps() -> AnyIterator<String> {
+    var fixed = scenario.steps.makeIterator()
+    var opened = false
+    return AnyIterator {
+        if let step = fixed.next() { return step }
+        guard let path = opts.steps else { return nil }
+        if !opened, path != "-", freopen(path, "r", stdin) == nil { fail("--steps: can't open \(path)") }
+        opened = true
+        while let line = readLine() {
+            let step = line.trimmingCharacters(in: .whitespaces)
+            if !step.isEmpty { return step }
+        }
+        return nil
+    }
+}
+
 Thread.detachNewThread {
-    for step in scenario.steps {
+    for step in allSteps() {
         let p = step.split(separator: " ").map(String.init)
         let v = p.dropFirst().compactMap(Double.init)
         emit("step", ["step": step])
