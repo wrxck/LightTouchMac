@@ -8,7 +8,7 @@ import os
 // connect (spawned by the app, DeviceLink), headless, oneshot (firmwarekit's boots) or machines.
 //
 // libqemu-arm.dylib: $LTM_QEMU_DYLIB, else ../Frameworks, else the build rpath.
-// Exit codes: QEMU's, or 64 usage, 70 no dylib, 72 rendezvous failed, 124 one-shot timeout.
+// Exit codes: QEMU's, or 64 usage, 70 no dylib, 71 no control socket, 72 rendezvous failed, 124 one-shot timeout.
 
 signal(SIGPIPE, SIG_IGN)
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -219,6 +219,8 @@ struct HeadlessConfig: Decodable {
     var dumpDir: String?
     var litFraction: Double?
     var maxSeconds: Double?
+    /// A Unix socket path for input, frames and the guest agent while the device runs (HeadlessControl).
+    var control: String?
 }
 
 func decodeConfig<T: Decodable>(_ path: String, _: T.Type) -> T {
@@ -262,6 +264,10 @@ func useDylib(_ dylib: String?) {
     }
 
     @Sendable func front() -> IOSurface? { reader.withLockUnchecked { $0?.front()?.surface } }
+    if let path = config.control {
+        guard let control = HeadlessControl(path: path, host: host, front: front) else { exit(71) }
+        control.start()
+    }
     let start = Date()
     Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
         emit(["event": "status", "t": Date().timeIntervalSince(start), "status": describe(status.snapshot())])

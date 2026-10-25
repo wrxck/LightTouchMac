@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""ltdev: run one prepared Light Touch device headless and drive it (tools/headless/README.md).
+
+  ltdev start | stop | status
+  ltdev tap X Y | hold X Y SECONDS | swipe X0 Y0 X1 Y1 [SECONDS] | type TEXT | key NAME|CODE
+  ltdev home | lock | button N [SECONDS] | paste TEXT | screen OUT.png
+  ltdev ping | sh COMMAND | run ARGV... | put LOCAL REMOTE [MODE] | get REMOTE LOCAL
+  ltdev ssh [SSH ARGS...] | scp [SCP ARGS...]   (the device is the host "device")
+
+X and Y are points from the top left of the portrait screen. Settings come from the environment:
+  LTM_APP      Light Touch.app (usbmuxd, inetcat, the emulator library, the SecureROMs)
+  LTM_HELPER   the LightTouchDevice to run (default: the app's)
+  LTM_BASE     the prepared base (firmwarekit create output)
+  LTM_RUN      the device's writable state: its overlay, NOR, logs and pid files (default: LTM_STATE/run/BASE NAME)
+  LTM_STATE    the sockets' directory (default ~/Library/Application Support/Light Touch/headless)
+  LTM_BOOT     ltm-boot (default: tools/headless/.build/release/ltm-boot)
+  LTM_SSH_KEY  the private key the device's root account accepts
+  LTM_SCALE    pixels per point (default 2 for a 640-pixel-wide screen, else 1)
+"""
+import base64
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def env(name, default=None):
+    value = os.environ.get(name, "")
+    if value:
+        return os.path.expanduser(value)
+    if default is None:
+        sys.exit(f"ltdev: set {name}")
+    return default
+
+
+APP = env("LTM_APP", "/Applications/Light Touch.app")
+STATE = env("LTM_STATE", os.path.expanduser("~/Library/Application Support/Light Touch/headless"))
+CONTROL = os.path.join(STATE, "ctl.sock")
+MUX_CLIENT = os.path.join(STATE, "mux-c.sock")
+MUX_GUEST = os.path.join(STATE, "mux-g.sock")
+
+
+def run_dir():
+    return env("LTM_RUN", os.path.join(STATE, "run", os.path.basename(env("LTM_BASE").rstrip("/"))))
+
+
+def alive(pidfile):
+    try:
+        pid = int(open(pidfile).read())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+# MARK: - The control socket (LightTouchDevice/HeadlessControl.swift)
+
+
+def raw(request: bytes, timeout=180) -> bytes:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(CONTROL)
+    except OSError as e:
+        sys.exit(f"ltdev: no device at {CONTROL} ({e.strerror}); run ltdev start")
+    s.sendall(request)
+    s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        b = s.recv(1 << 20)
+        if not b:
+            break
+        chunks.append(b)
+    return b"".join(chunks)
+
+
+def command(text: str) -> str:
+    reply = raw(("!" + text).encode()).decode(errors="replace")
+    if reply.startswith("!"):
+        sys.exit("ltdev: " + reply[1:].strip())
+    return reply
+
+
+def status() -> dict:
+    return dict(x.split("=", 1) for x in command("status").split())
+
+
+def points():
+    s = status()
+    w, h = int(s["width"]), int(s["height"])
+    if not w:
+        sys.exit("ltdev: no frame yet")
+    scale = float(os.environ.get("LTM_SCALE") or (2 if w >= 640 else 1))
+    return w / scale, h / scale
+
+
+def agent(op: str, args: str = "", body: bytes = b""):
+    rid = uuid.uuid4().hex[:12]
+    reply = raw(f"{rid} {op} {args}\n".encode() + base64.b64encode(body))
+    if reply.startswith(b"!"):
+        sys.exit("ltdev: " + reply[1:].decode(errors="replace").strip())
+    head, _, b64 = reply.partition(b"\n")
+    return int(head.split(b" ", 1)[1]), base64.b64decode(b64)
+
+
+def must(op, args="", body=b""):
+    code, out = agent(op, args, body)
+    if code != 0:
+        sys.exit(f"ltdev: {op} {args}: status {code}: {out.decode(errors='replace')}")
+    return out
+
+
+# agent wire limit for one put: a bigger file goes in parts (qemu-ios contrib/agent)
+PART = 256 * 1024 - 4097
+
+# Mac virtual key codes, US layout
+KEYS = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12, "w": 13,
+        "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25,
+        "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "l": 37, "j": 38,
+        "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46, ".": 47, "`": 50, " ": 49,
+        "\n": 36, "\t": 48}
+SHIFTED = {"!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+           "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", "\"": "'", "<": ",", ">": ".", "?": "/",
+           "~": "`"}
+NAMED = {"return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51, "escape": 53,
+         "left": 123, "right": 124, "down": 125, "up": 126}
+SHIFT = 56
+
+
+def press(code, shift=False):
+    if shift:
+        command(f"key {SHIFT} 1")
+        time.sleep(0.03)
+    command(f"key {code} 1")
+    time.sleep(0.06)
+    command(f"key {code} 0")
+    if shift:
+        time.sleep(0.03)
+        command(f"key {SHIFT} 0")
+    time.sleep(0.09)
+
+
+def type_text(text):
+    for ch in text:
+        if ch in KEYS:
+            press(KEYS[ch])
+        elif ch.isupper() and ch.lower() in KEYS:
+            press(KEYS[ch.lower()], True)
+        elif ch in SHIFTED:
+            press(KEYS[SHIFTED[ch]], True)
+        else:
+            sys.exit(f"ltdev: no key for {ch!r}; use paste")
+
+
+# MARK: - Start and stop
+
+
+def start():
+    run = run_dir()
+    base = env("LTM_BASE")
+    helper = env("LTM_HELPER", os.path.join(APP, "Contents/MacOS/LightTouchDevice"))
+    boot = env("LTM_BOOT", os.path.join(HERE, ".build/release/ltm-boot"))
+    if alive(os.path.join(run, "helper.pid")):
+        print(f"already running (helper {alive(os.path.join(run, 'helper.pid'))})")
+        return
+    os.makedirs(os.path.join(run, "usbmuxd-conf"), exist_ok=True)
+    os.makedirs(STATE, exist_ok=True)
+    # usbmuxd keeps pair records here; the app seeds it with its SystemBUID
+    conf = os.path.join(run, "usbmuxd-conf", "SystemConfiguration.plist")
+    if not os.path.exists(conf):
+        with open(os.path.join(APP, "Contents/Resources/usbmuxd-conf/SystemConfiguration.plist"), "rb") as f:
+            open(conf, "wb").write(f.read())
+    for path in (MUX_CLIENT, MUX_GUEST, CONTROL):
+        if os.path.exists(path):
+            os.unlink(path)
+    muxlog = open(os.path.join(run, "usbmuxd.log"), "ab")
+    mux = subprocess.Popen(
+        [os.path.join(APP, "Contents/MacOS/usbmuxd"), "-f", "-v", "-S", MUX_CLIENT, "-P", "NONE", "-C",
+         os.path.dirname(conf)],
+        env=dict(os.environ, USBMUXD_QEMU_ADDR=MUX_GUEST, USBMUXD_QEMU_DELAY="0"),
+        stdin=subprocess.DEVNULL, stdout=muxlog, stderr=muxlog, start_new_session=True)
+    open(os.path.join(run, "usbmuxd.pid"), "w").write(str(mux.pid))
+    config = os.path.join(run, "headless.json")
+    made = subprocess.run(
+        [boot, "--helper", helper, "--base", base, "--run", run,
+         "--files", os.path.join(APP, "Contents/Resources/Device"), "--usb", MUX_GUEST, "--control", CONTROL,
+         "--out", config], stdout=subprocess.DEVNULL)
+    if made.returncode != 0:
+        stop()
+        sys.exit("ltdev: ltm-boot failed")
+    launch = '{"mode":{"headless":{"config":%s}}}' % __import__("json").dumps(config)
+    out = open(os.path.join(run, "helper.jsonl"), "ab")
+    err = open(os.path.join(run, "helper.log"), "ab")
+    child = subprocess.Popen([helper, launch], stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                             start_new_session=True)
+    open(os.path.join(run, "helper.pid"), "w").write(str(child.pid))
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if child.poll() is not None:
+            stop()
+            sys.exit(f"ltdev: the helper exited with {child.returncode}; see {run}/helper.log")
+        if os.path.exists(CONTROL):
+            try:
+                if status().get("ready") == "1":
+                    break
+            except SystemExit:
+                pass
+        time.sleep(0.5)
+    else:
+        sys.exit(f"ltdev: the device is not ready after 300 s; see {run}/helper.log")
+    print(f"helper {child.pid}, usbmuxd {mux.pid}; serial log {run}/serial.log")
+
+
+def stop():
+    run = run_dir()
+    pid = alive(os.path.join(run, "helper.pid"))
+    if pid:
+        try:
+            raw(b"!halt", timeout=10)
+        except (OSError, SystemExit):
+            os.kill(pid, signal.SIGTERM)
+        for _ in range(120):
+            if not alive(os.path.join(run, "helper.pid")):
+                break
+            time.sleep(1)
+        else:
+            print("the helper did not stop in 120 s; killing it")
+            os.kill(pid, signal.SIGKILL)
+    mpid = alive(os.path.join(run, "usbmuxd.pid"))
+    if mpid:
+        os.kill(mpid, signal.SIGTERM)
+        # usbmuxd unlinks its sockets on exit; a restart must not race that
+        for _ in range(20):
+            if not alive(os.path.join(run, "usbmuxd.pid")):
+                break
+            time.sleep(0.5)
+    for path in (os.path.join(run, "helper.pid"), os.path.join(run, "usbmuxd.pid"), MUX_CLIENT, MUX_GUEST, CONTROL):
+        if os.path.exists(path):
+            os.unlink(path)
+    print("stopped")
+
+
+def ssh_options():
+    key = env("LTM_SSH_KEY")
+    # iOS 6's OpenSSH offers only ssh-rsa host keys; the ProxyCommand is the device's port 22 over usbmuxd
+    return ["-i", key, "-o", f"ProxyCommand={shlex.quote(os.path.join(APP, 'Contents/MacOS/inetcat'))} 22",
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+            "-o", "HostKeyAlgorithms=+ssh-rsa", "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+            "-o", "ConnectTimeout=120"]
+
+
+def main(a):
+    if not a:
+        sys.exit(__doc__)
+    c, args = a[0], a[1:]
+    f = []
+    for x in args:
+        try:
+            f.append(float(x))
+        except ValueError:
+            pass
+    if c == "start":
+        start()
+    elif c == "stop":
+        stop()
+    elif c == "status":
+        pid = alive(os.path.join(run_dir(), "helper.pid"))
+        print(f"helper running ({pid})" if pid else "helper not running")
+        if pid:
+            print(command("status"), end="")
+    elif c in ("tap", "hold"):
+        w, h = points()
+        command(f"touch 0 0 {f[0] / w:.5f} {f[1] / h:.5f}")
+        time.sleep(f[2] if c == "hold" else 0.08)
+        command(f"touch 0 2 {f[0] / w:.5f} {f[1] / h:.5f}")
+    elif c == "swipe":
+        w, h = points()
+        secs = f[4] if len(f) > 4 else 0.4
+        command(f"drag {f[0] / w:.5f} {f[1] / h:.5f} {f[2] / w:.5f} {f[3] / h:.5f} {secs}")
+    elif c == "type":
+        type_text(" ".join(args))
+    elif c == "key":
+        press(NAMED[args[0]] if args[0] in NAMED else int(args[0]))
+    elif c in ("home", "lock"):
+        command(f"button {0 if c == 'home' else 1}")
+    elif c == "button":
+        if len(f) > 1 and f[1] > 0.2:
+            command(f"buttondown {int(f[0])}")
+            time.sleep(f[1])
+            command(f"buttonup {int(f[0])}")
+        else:
+            command(f"button {int(f[0])}")
+    elif c == "paste":
+        command("paste " + " ".join(args))
+    elif c == "screen":
+        print(args[0] + ": " + "x".join(command("png " + os.path.abspath(args[0])).split()[1:]))
+    elif c == "ping":
+        print(must("ping").decode(), end="")
+    elif c in ("sh", "run"):
+        argv = ["/bin/sh", "-c", " ".join(args)] if c == "sh" else args
+        code, out = agent("spawn", "", b"".join(x.encode() + b"\0" for x in argv))
+        sys.stdout.write(out.decode(errors="replace"))
+        sys.exit(code if 0 <= code < 256 else 1)
+    elif c == "put":
+        data = open(args[0], "rb").read()
+        mode = args[2] if len(args) > 2 else "644"
+        if len(data) <= PART:
+            must("put", f"{args[1]} {mode}", data)
+        else:
+            off = 0
+            while off < len(data):
+                end = min(off + PART, len(data))
+                must("putpart", f"{off} {1 if end == len(data) else 0} {mode} {args[1]}", data[off:end])
+                off = end
+        print(f"{args[1]}: {len(data)} bytes")
+    elif c == "get":
+        code, out = agent("get", args[0])
+        if code == -27:  # too big for one reply: in ranges
+            out, off = b"", 0
+            while True:
+                piece = must("getrange", f"{off} {512 * 1024} {args[0]}")
+                if not piece:
+                    break
+                out += piece
+                off += len(piece)
+        elif code != 0:
+            sys.exit(f"ltdev: get {args[0]}: status {code}")
+        open(args[1], "wb").write(out)
+        print(f"{args[1]}: {len(out)} bytes")
+    elif c in ("ssh", "scp"):
+        os.environ["USBMUXD_SOCKET_ADDRESS"] = "UNIX:" + MUX_CLIENT
+        if c == "ssh":
+            os.execvp("ssh", ["ssh"] + ssh_options() + ["root@device"] + args)
+        os.execvp("scp", ["scp"] + ssh_options() + args)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
