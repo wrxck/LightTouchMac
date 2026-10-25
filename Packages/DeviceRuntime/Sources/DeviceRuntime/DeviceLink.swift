@@ -355,19 +355,19 @@ nonisolated public final class DeviceLink: @unchecked Sendable {
                 gdbSocket = gdb
             }
         }
-        let (id, channel, dead): (UInt64, LinkChannel<HelperMessage, AppMessage>?, Bool) = lock.withLock {
+        let (id, link, dead): (UInt64, LinkChannel<HelperMessage, AppMessage>?, Bool) = lock.withLock {
             let id = nextID
             nextID += 1
             return (id, channel, invalidated)
         }
-        guard let channel, !dead else { return queue.async { reply(.failure(.closed("not connected"))) } }
+        guard let link, !dead else { return queue.async { reply(.failure(.closed("not connected"))) } }
         let timer = DispatchWorkItem { [weak self] in
             guard let entry = self?.lock.withLock({ self?.pending.removeValue(forKey: id) }) else { return }
             entry.reply(.failure(.timedOut))
         }
         lock.withLock { pending[id] = Pending(timer: timer, reply: reply) }
         queue.asyncAfter(deadline: .now() + timeout, execute: timer)
-        if !channel.send(.request(id: id, request)) {
+        if !link.send(.request(id: id, request)) {
             if let entry = lock.withLock({ pending.removeValue(forKey: id) }) {
                 entry.timer.cancel()
                 queue.async { entry.reply(.failure(.helperFailure("request too large"))) }

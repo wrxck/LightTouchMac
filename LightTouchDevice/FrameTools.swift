@@ -61,4 +61,22 @@ enum FrameTools {
         CGImageDestinationAddImage(destination, image, nil)
         return CGImageDestinationFinalize(destination)
     }
+
+    /// The surface's pixels as tightly packed BGRA rows (its own rows may be padded).
+    static func packedBGRA(_ surface: IOSurface) -> Data {
+        surface.incrementUseCount()
+        surface.lock(options: .readOnly, seed: nil)
+        defer {
+            surface.unlock(options: .readOnly, seed: nil)
+            surface.decrementUseCount()
+        }
+        let rowBytes = surface.width * 4
+        var data = Data(count: rowBytes * surface.height)
+        data.withUnsafeMutableBytes { out in
+            for y in 0..<surface.height {
+                memcpy(out.baseAddress! + y * rowBytes, surface.baseAddress + y * surface.bytesPerRow, rowBytes)
+            }
+        }
+        return data
+    }
 }
